@@ -1,6 +1,6 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, send_file
 from datetime import datetime
-import json
+import json, os
 
 app = Flask(__name__)
 
@@ -12,6 +12,11 @@ pending_commands = {}
 def index():
     # Menampilkan halaman HTML dashboard
     return render_template('index.html')
+
+@app.route('/agent.deb')
+def download_deb():
+    deb_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lab-monitoring-agent_1.0.0_all.deb')
+    return send_file(deb_path, as_attachment=True, download_name='lab-monitoring-agent_1.0.0_all.deb')
 
 @app.route('/api/command', methods=['POST'])
 def send_command():
@@ -48,6 +53,13 @@ def monitoring():
         # Tambahkan waktu terakhir data diterima
         data['last_seen'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
+        # Hapus entri duplikat lama jika berasal dari IP lokal yang sama namun MAC lama sempat berubah
+        incoming_ip = data.get('local_ip')
+        if incoming_ip and incoming_ip != '127.0.0.1':
+            stale_macs = [m for m, d in computers_data.items() if m != mac and d.get('local_ip') == incoming_ip]
+            for old_mac in stale_macs:
+                computers_data.pop(old_mac, None)
+
         # Simpan atau update data PC berdasarkan MAC Address
         computers_data[mac] = data
         

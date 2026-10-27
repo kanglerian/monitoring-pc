@@ -48,8 +48,16 @@ def execute_power_command(cmd):
             msg = "Komputer akan dimatikan oleh Operator Lab dalam 10 detik." if cmd == "shutdown" else "Komputer akan di-restart oleh Operator Lab dalam 10 detik."
             subprocess.Popen(["shutdown", flag, "/t", "10", "/c", msg])
         else:
-            action = "poweroff" if cmd == "shutdown" else "reboot"
-            subprocess.Popen(["systemctl", action])
+            if cmd == "shutdown":
+                # Coba lewat sudo tanpa password (dari /etc/sudoers.d/lab-monitoring-agent), lalu systemctl/dbus sesi aktif, lalu fallback
+                cmds = [
+                    "sudo -n /sbin/shutdown -h now || sudo -n /usr/sbin/shutdown -h now || systemctl poweroff || dbus-send --system --print-reply --dest=org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager.PowerOff boolean:false || systemctl poweroff -i || /sbin/poweroff"
+                ]
+            else:
+                cmds = [
+                    "sudo -n /sbin/shutdown -r now || sudo -n /usr/sbin/shutdown -r now || systemctl reboot || dbus-send --system --print-reply --dest=org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager.Reboot boolean:false || systemctl reboot -i || /sbin/reboot"
+                ]
+            subprocess.Popen(["/bin/sh", "-c", cmds[0]])
     except Exception:
         pass
 
@@ -113,7 +121,10 @@ def extract_host_display(server_url):
 
 def load_config():
     cfg_path = get_config_path()
-    for path in [cfg_path, "/etc/lab_monitoring/config.json"]:
+    search_paths = [cfg_path, "/etc/lab_monitoring/config.json"]
+    if platform.system() == "Linux":
+        search_paths.extend(sorted(glob.glob("/home/*/.config/lab_monitoring/config.json")))
+    for path in search_paths:
         if os.path.exists(path):
             try:
                 with open(path, "r") as f:
@@ -133,6 +144,14 @@ def save_config(raw_host):
     }
     with open(cfg_path, "w") as f:
         json.dump(data, f, indent=2)
+    # Simpan juga ke /etc/lab_monitoring/config.json di Linux agar systemd service bisa membacanya saat boot
+    if platform.system() == "Linux" and cfg_path != "/etc/lab_monitoring/config.json":
+        try:
+            os.makedirs("/etc/lab_monitoring", exist_ok=True)
+            with open("/etc/lab_monitoring/config.json", "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
     sudo_uid = os.environ.get("SUDO_UID")
     sudo_gid = os.environ.get("SUDO_GID")
     if sudo_uid and sudo_gid:
@@ -181,6 +200,7 @@ def setup_autostart():
 
 def ensure_background_running():
     my_pid = str(os.getpid())
+    # Hentikan proses background lama terlebih dahulu agar selalu menggunakan versi & config terbaru
     try:
         if platform.system() == "Linux":
             for pid_dir in glob.glob("/proc/[0-9]*"):
@@ -190,8 +210,8 @@ def ensure_background_running():
                 try:
                     with open(os.path.join(pid_dir, "cmdline"), "rb") as f:
                         cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
-                    if ("agent.py" in cmdline or "lab-monitoring-agent" in cmdline) and "--config" not in cmdline:
-                        return
+                    if "python" in cmdline and ("agent.py" in cmdline or "/usr/bin/lab-monitoring-agent" in cmdline) and "--config" not in cmdline:
+                        os.kill(int(pid), 15)
                 except Exception:
                     pass
         elif psutil:
@@ -200,7 +220,7 @@ def ensure_background_running():
                     continue
                 cmdline = " ".join(proc.info.get('cmdline') or [])
                 if ("agent.py" in cmdline or "LabMonitoringAgent" in cmdline) and "--config" not in cmdline:
-                    return
+                    proc.terminate()
     except Exception:
         pass
 
@@ -314,6 +334,34 @@ def show_config_dialog(default_host="localhost:5000"):
         return save_config(default_host)
 
 def get_mac_address():
+    if platform.system() == "Linux":
+        try:
+            candidates = []
+            for addr_file in sorted(glob.glob("/sys/class/net/*/address")):
+                iface_dir = os.path.dirname(addr_file)
+                iface = os.path.basename(iface_dir)
+                if iface == "lo" or iface.startswith(("docker", "veth", "br-", "virbr", "tun", "tap")):
+                    continue
+                with open(addr_file, "r") as f:
+                    mac_str = f.read().strip().upper()
+                if mac_str and mac_str != "00:00:00:00:00:00" and len(mac_str) == 17:
+                    is_physical = os.path.exists(os.path.join(iface_dir, "device"))
+                    candidates.append((0 if is_physical else 1, iface, mac_str))
+            if candidates:
+                candidates.sort()
+                return candidates[0][2]
+        except Exception:
+            pass
+        try:
+            if os.path.exists("/etc/machine-id"):
+                with open("/etc/machine-id", "r") as f:
+                    mid = f.read().strip()
+                if len(mid) >= 12:
+                    h = mid[:12].upper()
+                    return ":".join([h[i:i+2] for i in range(0, 12, 2)])
+        except Exception:
+            pass
+
     mac = uuid.UUID(int=uuid.getnode()).hex[-12:]
     return ":".join([mac[e:e+2] for e in range(0, 11, 2)]).upper()
 
@@ -427,7 +475,23 @@ def get_logged_in_user():
                 return ", ".join(names)
     except Exception:
         pass
-    return os.environ.get("SUDO_USER") or os.environ.get("USER") or os.environ.get("USERNAME") or "Unknown"
+    if platform.system() == "Linux":
+        try:
+            res = subprocess.run(["loginctl", "list-users", "--no-legend"], capture_output=True, text=True, timeout=2)
+            if res.returncode == 0 and res.stdout.strip():
+                names = sorted(list({line.split()[1] for line in res.stdout.strip().splitlines() if len(line.split()) >= 2 and line.split()[1] != "root"}))
+                if names:
+                    return ", ".join(names)
+        except Exception:
+            pass
+    user_env = os.environ.get("SUDO_USER") or os.environ.get("USER") or os.environ.get("USERNAME")
+    if user_env and user_env != "root":
+        return user_env
+    if platform.system() == "Linux":
+        homes = [os.path.basename(p) for p in sorted(glob.glob("/home/*")) if os.path.isdir(p)]
+        if homes:
+            return homes[0]
+    return user_env or "Unknown"
 
 def get_top_process():
     ignore_names = {"System Idle Process", "System", "Registry", "MemCompression"}
@@ -747,6 +811,12 @@ def resolve_initial_config():
             cfg = save_config(args[idx + 1])
             ensure_background_running()
             return cfg
+
+    if "--background" in args and current_cfg is None:
+        return {
+            "server_host": default_host,
+            "server_url": normalize_server_url(default_host)
+        }
 
     is_frozen_interactive = getattr(sys, "frozen", False) and ("--background" not in args)
     if ("--config" in args) or (current_cfg is None) or is_frozen_interactive:
